@@ -19,7 +19,7 @@ class YamahaPacketCodec
 		# State transitions:
 		# :desync in:  0xcc -> :sync_cc, _ -> :desync
 		# :sync_cc in: 0xaa -> :synced, 0xcc -> :sync_cc, _ -> :desync
-		# :synced in:  1byte -> [mark payload length] :reading
+		# :synced in:  1byte -> [mark payload length] length > 0 ? :reading : :csum
 		# :reading in: 1byte -> [remember] collected bytes \lt length :reading || :csum
 		# :csum    in: 1byte -> [verify checksum, process pkt] :desync
 		@state = :desync
@@ -52,7 +52,11 @@ class YamahaPacketCodec
 			when :synced
 				@pload = []
 				@length = b.ord
-				@state = :reading
+				if @length > 0
+					@state = :reading
+				else
+					@state = :csum
+				end
 			when :reading
 				@pload << b
 				if @pload.size == @length

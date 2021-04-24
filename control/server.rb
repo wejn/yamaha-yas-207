@@ -42,6 +42,8 @@ class YamahaSoundbarFake
 	def handle_received(packet)
 		return if packet == :reset || packet == :heartbeat
 		case packet.first
+		when nil # empty packet
+			puts "? Empty packet. Huh?"
 		when 0x1 # client handshake
 			if packet == [1, 72, 84, 83, 32, 67, 111, 110, 116]
 				# if we're doing a handshake, we might as well pretend to be just init'd.
