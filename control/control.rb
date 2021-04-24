@@ -45,13 +45,13 @@ class YamahaSoundbarRemote
 		set_input_tv: "4078df",
 
 		# surround management
-		set_3d_surround: "4078c9",
-		set_tvprogram: "407ef1",
-		set_stereo: "407850",
-		set_movie: "4078d9",
-		set_music: "4078da",
-		set_sports: "4078db",
-		set_game: "4078dc",
+		set_surround_3d: "4078c9", # -- 3d surround
+		set_surround_tv: "407ef1", # -- tv program
+		set_surround_stereo: "407850",
+		set_surround_movie: "4078d9",
+		set_surround_music: "4078da",
+		set_surround_sports: "4078db",
+		set_surround_game: "4078dc",
 		surround_toggle: "4078b4", # -- sets surround to `:movie` (or `:"3d"` if already `:movie`)
 		clearvoice_toggle: "40785c",
 		clearvoice_on: "407e80",
@@ -102,10 +102,25 @@ class YamahaSoundbarRemote
 	# How often to refresh status.
 	STATUS_REFRESH = 30
 
+	# Volume range accepted by the device
+	VOLUME_RANGE = (0..0x32)
+
+	# Domain (range) valid for the device
+	SUBWOOFER_DOMAIN = 0.step(0x20, 4).to_a
+
+	# Initial intent enforced at the first sync (more in `handle_received`, tho)
+	INITIAL_INTENT = {
+		subwoofer: 16,
+		surround: :tv,
+		bass_ext: true,
+		clearvoice: false,
+	}.freeze
+
 	def initialize
 		@device_state = {}
 		@queue = Queue.new
 		@state = :initial
+		@intent = {}
 	end
 	attr_reader :device_state
 
@@ -142,24 +157,39 @@ class YamahaSoundbarRemote
 				end
 			when 0x00 # response to init followup?
 				if @state == :init_followup
-					enqueue(COMMANDS[:set_input_hdmi])
-					enqueue(COMMANDS[:power_off])
-					enqueue(COMMANDS[:report_status])
 					@state = :synced
 					@last_status_at = Time.now
+					add_intent({initial: true})
 					if packet != [0, 2, 0]
 						STDERR.puts "? Received unexpected init_followup packet: #{packet.inspect}"
 					end
 				else
-					puts "+ Received: #{packet.inspect}" # FIXME
+					puts "? Received: #{packet.inspect}" # FIXME
 				end
 			when 0x05 # device status reply
 				params = parse_device_status(packet)
 				puts "+ DS: #{params.map { |k,v| "#{k}:#{v}" }.join(',')}"
 				@device_state = params
-				# FIXME: remember volume per input?
+				if @intent[:initial]
+					# We have initial intent, but we also can have some other
+					# intent already in from the user. So let's use our initial
+					# with an update from the user as the final thing.
+					intent = INITIAL_INTENT.dup
+					if @device_state[:power] && @device_state[:input] == :bluetooth
+						# we probably just woke up the device → put it back to sleep @ HDMI
+						intent.update({input: :hdmi, power: false})
+					end
+					rest_of_intent = @intent.dup
+					rest_of_intent.delete(:initial)
+					intent.update(rest_of_intent)
+					@intent = intent
+				end
+				# and now enforce it
+				unless @intent.empty?
+					@intent = enforce_intent(@intent)
+				end
 			else
-				puts "+ Received: #{packet.inspect}" # FIXME
+				puts "? Received: #{packet.inspect}" # FIXME
 			end
 		end
 	end
@@ -168,7 +198,7 @@ class YamahaSoundbarRemote
 		params = {}
 		params[:power] = !pkt[2].zero?
 		params[:input] = INPUT_NAMES[pkt[3]] || pkt[3]
-		params[:muted] = !pkt[4].zero?
+		params[:mute] = !pkt[4].zero?
 		params[:volume] = pkt[5]
 		params[:subwoofer] = pkt[6]
 		srd = (pkt[10] << 8) + pkt[11]
@@ -182,6 +212,74 @@ class YamahaSoundbarRemote
 		cmd = YamahaPacketCodec.encode(command)
 		@queue.push([Time.now, cmd])
 		cmd
+	end
+
+	# Add given intent
+	private def add_intent(intent)
+		@intent.update(intent)
+		enqueue(COMMANDS[:report_status])
+		@intent.dup
+	end
+
+	# Enforce given intent and return whatever couldn't have been enforced.
+	private def enforce_intent(intent)
+		intent = intent.dup
+		retried = intent.delete(:enforce_retried)
+		device_state = @device_state.dup
+
+		delta_keys = intent.keys.reduce([]) { |m, x| m << x unless device_state[x] == intent[x]; m }
+
+		return {} if delta_keys.empty? # zero diff → stable state reached
+		# also zero diff (mute doesn't work when powered off) >>
+		return {} if delta_keys == [:mute] && device_state[:power] == false
+
+		# pathological case: power_off and non-empty list of commands
+		if !device_state[:power] && !(delta_keys - [:power]).empty?
+			enqueue(COMMANDS[:power_on]) # turn on
+			device_state[:power] = true # mark it's on
+			delta_keys << :power unless delta_keys.include?(:power)
+			intent[:power] ||= false # force off (unless intended otherwise)
+		end
+
+		# first power on (if needed)
+		if intent[:power] && !device_state[:power]
+			enqueue(COMMANDS[:power_on])
+		end
+
+		# enforce individual keys
+		keys_to_enforce = [
+			:input, :mute, :volume, :subwoofer, :surround, :bass_ext,
+			:clearvoice, :power]
+		(keys_to_enforce & delta_keys).each do |k|
+			case k
+			when :input
+				enqueue(COMMANDS[('set_input_' + intent[k].to_s).to_sym])
+			when :volume
+				delta = intent[:volume] - device_state[:volume]
+				delta.abs.times {
+					enqueue(COMMANDS[delta < 0 ? :volume_down : :volume_up]) }
+			when :subwoofer
+				delta = intent[:subwoofer] - device_state[:subwoofer]
+				(delta.abs / 4).times {
+					enqueue(
+						COMMANDS[delta < 0 ? :subwoofer_down : :subwoofer_up]) }
+			when :surround
+				enqueue(COMMANDS[('set_surround_' + intent[k].to_s).to_sym])
+			when :mute, :bass_ext, :clearvoice, :power
+				enqueue(COMMANDS[(k.to_s + (intent[k] ? '_on' : '_off')).to_sym])
+			else
+				STERR.puts "! enforce_intent for unimplemented key: #{k}"
+			end
+		end
+
+		if retried
+			STDERR.puts "~ enforce_intent: loop breaker: #{intent.inspect} on #{device_state}, delta: #{delta_keys}" if $VERBOSE || $DEBUG
+			{}
+		else
+			# had a diff, let's have another round after this one
+			enqueue(COMMANDS[:report_status])
+			intent.update({enforce_retried: true}) # avoid endless looping
+		end
 	end
 
 	# Send raw command to device -- called by end users (if they speak raw).
@@ -209,6 +307,70 @@ class YamahaSoundbarRemote
 			else
 				raise ArgumentError, "unknown command: #{command}"
 			end
+		else
+			raise RuntimeError, "device not ready"
+		end
+	end
+
+	# Send a given intent to device -- called by end users.
+	#
+	# @param intent [Hash<String, Object>] intent to send.
+	# @raise [RuntimeError] when device not ready
+	# @raise [ArgumentError] when the intent is wrong
+	def send_intent(intent)
+		if @state == :synced
+			validated_intent = {}
+			is_bool = proc { |x|
+				unless x === true || x === false
+					raise ArgumentError, "must be bool"
+				else
+					x
+				end
+			}
+			valid_keys = {
+				power: is_bool,
+				mute: is_bool,
+				bass_ext: is_bool,
+				clearvoice: is_bool,
+				input: proc { |x|
+					if INPUT_NAMES.values.include?(x.to_sym)
+						x.to_sym
+					else
+						raise ArgumentError, "must be one of: #{INPUT_NAMES.values.inspect}"
+					end
+				},
+				volume: proc { |x|
+					if VOLUME_RANGE.include?(Integer(x))
+						Integer(x)
+					else
+						raise ArgumentError, "must be integer in: #{VOLUME_RANGE}"
+					end
+				},
+				subwoofer: proc { |x|
+					if SUBWOOFER_DOMAIN.include?(Integer(x))
+						Integer(x)
+					else
+						raise ArgumentError, "must be integer in: #{SUBWOOFER_DOMAIN}"
+					end
+
+				},
+				surround: proc { |x|
+					if SURROUND_NAMES.values.include?(x.to_sym)
+						x.to_sym
+					else
+						raise ArgumentError, "must be one of: #{SURROUND_NAMES.values.inspect}"
+					end
+				},
+			}
+			validated_intent = intent.map { |k, v|
+				raise ArgumentError, "invalid key: #{k}" unless valid_keys[k.to_sym]
+				begin
+					[k.to_sym, valid_keys[k.to_sym][v]]
+				rescue
+					raise ArgumentError, "#{k} #$!"
+				end
+			}.to_h
+			add_intent(validated_intent)
 		else
 			raise RuntimeError, "device not ready"
 		end
@@ -274,6 +436,15 @@ if __FILE__ == $0
 						out << "failed to send #{q["command"].inspect}: #{$!}.\n"
 						break
 					end
+				end
+				res.body = out.join
+			elsif q["intent"]
+				out = []
+				begin
+					sent = ysr.send_intent(JSON.parse(q['intent']))
+					out << "send intent: #{sent}.\n"
+				rescue
+					out << "failed to send intent #{q["intent"].inspect}: #{$!}.\n"
 				end
 				res.body = out.join
 			else
