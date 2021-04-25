@@ -121,6 +121,7 @@ class YamahaSoundbarRemote
 		@queue = Queue.new
 		@state = :initial
 		@intent = {}
+		@session = nil
 	end
 	attr_reader :device_state
 
@@ -183,6 +184,29 @@ class YamahaSoundbarRemote
 					rest_of_intent.delete(:initial)
 					intent.update(rest_of_intent)
 					@intent = intent
+				elsif @intent[:start_session]
+					name = @intent.delete(:start_session)
+					if @session
+						STDERR.puts "! Starting a new session '#{name}' while" +
+							" '#{@session.first}' active; re-using the DS:" +
+							" #{@session.last.inspect}; intent:" +
+							" #{@intent.inspect}."
+						@session = [name, @session.last]
+					else
+						puts "+ Starting a new session '#{name}' with" +
+							" intent: #{@intent.inspect}."
+						@session = [name, @device_state.dup]
+					end
+				elsif @intent[:stop_session]
+					name = @intent.delete(:stop_session)
+					if @session
+						if @session.first != name
+							STDERR.puts "! Terminating session '#{name}' while" +
+								" '#{@session.first}' active."
+						end
+						@intent.update(@session.last)
+						@session = nil
+					end
 				end
 				# and now enforce it
 				unless @intent.empty?
@@ -248,8 +272,8 @@ class YamahaSoundbarRemote
 
 		# enforce individual keys
 		keys_to_enforce = [
-			:input, :mute, :volume, :subwoofer, :surround, :bass_ext,
-			:clearvoice, :power]
+			:input, :volume, :subwoofer, :surround, :bass_ext, :clearvoice,
+			:mute, :power]
 		(keys_to_enforce & delta_keys).each do |k|
 			case k
 			when :input
@@ -312,6 +336,33 @@ class YamahaSoundbarRemote
 		end
 	end
 
+	# Start a session with a given intent to device -- called by end users.
+	#
+	# @param name [String] session name.
+	# @param intent [Hash<String, Object>] intent to send.
+	# @raise [RuntimeError] when device not ready
+	# @raise [ArgumentError] when the intent is wrong
+	def start_session(name, intent)
+		if @state == :synced
+			add_intent(parse_intent(intent).update({start_session: name}))
+		else
+			raise RuntimeError, "device not ready"
+		end
+	end
+
+	# Terminate a session -- called by end users.
+	#
+	# @param name [String] session name.
+	# @raise [RuntimeError] when device not ready
+	# @raise [ArgumentError] when the intent is wrong
+	def stop_session(name)
+		if @state == :synced
+			add_intent({stop_session: name})
+		else
+			raise RuntimeError, "device not ready"
+		end
+	end
+
 	# Send a given intent to device -- called by end users.
 	#
 	# @param intent [Hash<String, Object>] intent to send.
@@ -319,61 +370,65 @@ class YamahaSoundbarRemote
 	# @raise [ArgumentError] when the intent is wrong
 	def send_intent(intent)
 		if @state == :synced
-			validated_intent = {}
-			is_bool = proc { |x|
-				unless x === true || x === false
-					raise ArgumentError, "must be bool"
-				else
-					x
-				end
-			}
-			valid_keys = {
-				power: is_bool,
-				mute: is_bool,
-				bass_ext: is_bool,
-				clearvoice: is_bool,
-				input: proc { |x|
-					if INPUT_NAMES.values.include?(x.to_sym)
-						x.to_sym
-					else
-						raise ArgumentError, "must be one of: #{INPUT_NAMES.values.inspect}"
-					end
-				},
-				volume: proc { |x|
-					if VOLUME_RANGE.include?(Integer(x))
-						Integer(x)
-					else
-						raise ArgumentError, "must be integer in: #{VOLUME_RANGE}"
-					end
-				},
-				subwoofer: proc { |x|
-					if SUBWOOFER_DOMAIN.include?(Integer(x))
-						Integer(x)
-					else
-						raise ArgumentError, "must be integer in: #{SUBWOOFER_DOMAIN}"
-					end
-
-				},
-				surround: proc { |x|
-					if SURROUND_NAMES.values.include?(x.to_sym)
-						x.to_sym
-					else
-						raise ArgumentError, "must be one of: #{SURROUND_NAMES.values.inspect}"
-					end
-				},
-			}
-			validated_intent = intent.map { |k, v|
-				raise ArgumentError, "invalid key: #{k}" unless valid_keys[k.to_sym]
-				begin
-					[k.to_sym, valid_keys[k.to_sym][v]]
-				rescue
-					raise ArgumentError, "#{k} #$!"
-				end
-			}.to_h
-			add_intent(validated_intent)
+			add_intent(parse_intent(intent))
 		else
 			raise RuntimeError, "device not ready"
 		end
+	end
+
+	private def parse_intent(intent)
+		validated_intent = {}
+		is_bool = proc { |x|
+			unless x === true || x === false
+				raise ArgumentError, "must be bool"
+			else
+				x
+			end
+		}
+		valid_keys = {
+			power: is_bool,
+			mute: is_bool,
+			bass_ext: is_bool,
+			clearvoice: is_bool,
+			input: proc { |x|
+				if INPUT_NAMES.values.include?(x.to_sym)
+					x.to_sym
+				else
+					raise ArgumentError, "must be one of: #{INPUT_NAMES.values.inspect}"
+				end
+			},
+			volume: proc { |x|
+				if VOLUME_RANGE.include?(Integer(x))
+					Integer(x)
+				else
+					raise ArgumentError, "must be integer in: #{VOLUME_RANGE}"
+				end
+			},
+			subwoofer: proc { |x|
+				if SUBWOOFER_DOMAIN.include?(Integer(x))
+					Integer(x)
+				else
+					raise ArgumentError, "must be integer in: #{SUBWOOFER_DOMAIN}"
+				end
+
+			},
+			surround: proc { |x|
+				if SURROUND_NAMES.values.include?(x.to_sym)
+					x.to_sym
+				else
+					raise ArgumentError, "must be one of: #{SURROUND_NAMES.values.inspect}"
+				end
+			},
+		}
+		validated_intent = intent.map { |k, v|
+			raise ArgumentError, "invalid key: #{k}" unless valid_keys[k.to_sym]
+			begin
+				[k.to_sym, valid_keys[k.to_sym][v]]
+			rescue
+				raise ArgumentError, "#{k} #$!"
+			end
+		}.to_h
+		validated_intent
 	end
 
 	# Fetch next packet to be sent to device -- called by comm handler.
@@ -449,6 +504,40 @@ if __FILE__ == $0
 				res.body = out.join
 			else
 				res.body = "nope (missing params: either data or commands).\n"
+			end
+		end
+
+		s.mount_proc("/start-session") do |req, res|
+			q = req.query
+			res['Content-Type'] = 'text/plain; charset=utf-8'
+			out = []
+			if q["name"] && q["intent"]
+				begin
+					reply = ysr.start_session(q['name'], JSON.parse(q['intent']))
+					out << "start session: #{reply}.\n"
+				rescue
+					out << "failed to start session: #{$!}.\n"
+				end
+				res.body = out.join
+			else
+				res.body = "nope (missing params: either name or intent).\n"
+			end
+		end
+
+		s.mount_proc("/stop-session") do |req, res|
+			q = req.query
+			res['Content-Type'] = 'text/plain; charset=utf-8'
+			out = []
+			if q["name"]
+				begin
+					reply = ysr.stop_session(q['name'])
+					out << "stop session: #{reply}.\n"
+				rescue
+					out << "failed to stop session: #{$!}.\n"
+				end
+				res.body = out.join
+			else
+				res.body = "nope (missing params: either name or intent).\n"
 			end
 		end
 
